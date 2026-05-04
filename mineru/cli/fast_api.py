@@ -154,6 +154,8 @@ class ParseRequestOptions:
     return_images: bool
     response_format_zip: bool
     return_original_file: bool
+    return_layout_pdf: bool
+    return_span_pdf: bool
     start_page_id: int
     end_page_id: int
 
@@ -185,6 +187,8 @@ class AsyncParseTask:
     return_images: bool
     response_format_zip: bool
     return_original_file: bool
+    return_layout_pdf: bool
+    return_span_pdf: bool
     start_page_id: int
     end_page_id: int
     upload_names: list[str]
@@ -480,6 +484,8 @@ def build_result_dict(
     return_model_output: bool,
     return_content_list: bool,
     return_images: bool,
+    return_layout_pdf: bool,
+    return_span_pdf: bool,
 ) -> dict[str, dict[str, Any]]:
     result_dict: dict[str, dict[str, Any]] = {}
     for pdf_name in pdf_file_names:
@@ -514,6 +520,16 @@ def build_result_dict(
                 ): f"data:{get_image_mime_type(image_path)};base64,{encode_image(image_path)}"
                 for image_path in image_paths
             }
+        if return_layout_pdf:
+            layout_path = os.path.join(parse_dir, f"{pdf_name}_layout.pdf")
+            if os.path.exists(layout_path):
+                data["layout_pdf"] = (
+                    f"data:application/pdf;base64,{encode_image(layout_path)}"
+                )
+        if return_span_pdf:
+            span_path = os.path.join(parse_dir, f"{pdf_name}_span.pdf")
+            if os.path.exists(span_path):
+                data["span_pdf"] = f"data:application/pdf;base64,{encode_image(span_path)}"
     return result_dict
 
 
@@ -536,6 +552,8 @@ def create_result_zip(
     return_content_list: bool,
     return_images: bool,
     return_original_file: bool,
+    return_layout_pdf: bool,
+    return_span_pdf: bool,
 ) -> str:
     zip_fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="mineru_results_")
     os.close(zip_fd)
@@ -638,6 +656,30 @@ def create_result_zip(
                             path.name,
                         ),
                     )
+
+            if return_layout_pdf:
+                path = os.path.join(parse_dir, f"{pdf_name}_layout.pdf")
+                if os.path.exists(path):
+                    zf.write(
+                        path,
+                        arcname=build_zip_arcname(
+                            pdf_name,
+                            parse_dir,
+                            f"{pdf_name}_layout.pdf",
+                        ),
+                    )
+
+            if return_span_pdf:
+                path = os.path.join(parse_dir, f"{pdf_name}_span.pdf")
+                if os.path.exists(path):
+                    zf.write(
+                        path,
+                        arcname=build_zip_arcname(
+                            pdf_name,
+                            parse_dir,
+                            f"{pdf_name}_span.pdf",
+                        ),
+                    )
     return zip_path
 
 
@@ -665,6 +707,8 @@ async def build_result_response(
     return_images: bool,
     response_format_zip: bool,
     return_original_file: bool,
+    return_layout_pdf: bool,
+    return_span_pdf: bool,
     zip_filename: str = "results.zip",
 ) -> Response:
     if response_format_zip:
@@ -681,6 +725,8 @@ async def build_result_response(
                 return_content_list=return_content_list,
                 return_images=return_images,
                 return_original_file=return_original_file,
+                return_layout_pdf=return_layout_pdf,
+                return_span_pdf=return_span_pdf,
             )
         )
         try:
@@ -707,6 +753,8 @@ async def build_result_response(
         return_model_output=return_model_output,
         return_content_list=return_content_list,
         return_images=return_images,
+        return_layout_pdf=return_layout_pdf,
+        return_span_pdf=return_span_pdf,
     )
     return JSONResponse(
         status_code=status_code,
@@ -749,6 +797,8 @@ async def build_sync_file_parse_response(
             return_images=task.return_images,
             response_format_zip=task.response_format_zip,
             return_original_file=task.return_original_file,
+            return_layout_pdf=task.return_layout_pdf,
+            return_span_pdf=task.return_span_pdf,
             zip_filename=f"{task.task_id}.zip",
         )
         response.headers[FILE_PARSE_TASK_ID_HEADER] = task.task_id
@@ -768,6 +818,8 @@ async def build_sync_file_parse_response(
         return_model_output=task.return_model_output,
         return_content_list=task.return_content_list,
         return_images=task.return_images,
+        return_layout_pdf=task.return_layout_pdf,
+        return_span_pdf=task.return_span_pdf,
     )
     return JSONResponse(
         status_code=200,
@@ -881,6 +933,24 @@ async def parse_request_form(
             ),
         ),
     ] = False,
+    return_layout_pdf: Annotated[
+        bool,
+        Form(
+            description=(
+                "Draw layout-detection boxes on a PDF ({name}_layout.pdf); "
+                "included in ZIP when response_format_zip=true, or as layout_pdf in JSON results."
+            ),
+        ),
+    ] = False,
+    return_span_pdf: Annotated[
+        bool,
+        Form(
+            description=(
+                "Draw span boxes on a PDF ({name}_span.pdf); "
+                "included in ZIP when response_format_zip=true, or as span_pdf in JSON results."
+            ),
+        ),
+    ] = False,
     start_page_id: Annotated[
         int,
         Form(description="The starting page for PDF parsing, beginning from 0"),
@@ -916,6 +986,8 @@ async def parse_request_form(
         return_images=return_images,
         response_format_zip=response_format_zip,
         return_original_file=effective_return_original_file,
+        return_layout_pdf=return_layout_pdf,
+        return_span_pdf=return_span_pdf,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
     )
@@ -1006,7 +1078,8 @@ async def run_parse_job(
     actual_lang_list = normalize_lang_list(request_options.lang_list, len(pdf_file_names))
     response_file_names = list(pdf_file_names)
 
-    parse_kwargs = dict(
+    parse_kwargs = dict(config or {})
+    parse_kwargs.update(
         output_dir=output_dir,
         pdf_file_names=list(pdf_file_names),
         pdf_bytes_list=list(pdf_bytes_list),
@@ -1016,8 +1089,8 @@ async def run_parse_job(
         formula_enable=request_options.formula_enable,
         table_enable=request_options.table_enable,
         server_url=request_options.server_url,
-        f_draw_layout_bbox=False,
-        f_draw_span_bbox=False,
+        f_draw_layout_bbox=request_options.return_layout_pdf,
+        f_draw_span_bbox=request_options.return_span_pdf,
         f_dump_md=request_options.return_md,
         f_dump_middle_json=request_options.return_middle_json,
         f_dump_model_output=request_options.return_model_output,
@@ -1027,7 +1100,6 @@ async def run_parse_job(
         f_dump_content_list=request_options.return_content_list,
         start_page_id=request_options.start_page_id,
         end_page_id=request_options.end_page_id,
-        **config,
     )
 
     if request_options.backend == "pipeline":
@@ -1075,6 +1147,8 @@ async def create_async_parse_task(
             return_images=request_options.return_images,
             response_format_zip=request_options.response_format_zip,
             return_original_file=request_options.return_original_file,
+            return_layout_pdf=request_options.return_layout_pdf,
+            return_span_pdf=request_options.return_span_pdf,
             start_page_id=request_options.start_page_id,
             end_page_id=request_options.end_page_id,
             upload_names=[upload.original_name for upload in uploads],
@@ -1512,6 +1586,8 @@ async def get_async_task_result(
         return_images=task.return_images,
         response_format_zip=task.response_format_zip,
         return_original_file=task.return_original_file,
+        return_layout_pdf=task.return_layout_pdf,
+        return_span_pdf=task.return_span_pdf,
         zip_filename=f"{task.task_id}.zip",
     )
 

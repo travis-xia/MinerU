@@ -50,6 +50,9 @@ def build_form_data(
     server_url: str | None,
     start_page_id: int,
     end_page_id: int | None,
+    *,
+    return_layout_pdf: bool = False,
+    return_span_pdf: bool = False,
 ) -> dict[str, str | list[str]]:
     return _api_client.build_parse_request_form_data(
         lang_list=[language],
@@ -67,6 +70,8 @@ def build_form_data(
         return_images=True,
         response_format_zip=True,
         return_original_file=False,
+        return_layout_pdf=return_layout_pdf,
+        return_span_pdf=return_span_pdf,
     )
 
 
@@ -101,13 +106,25 @@ async def run_demo(
     server_url: str | None = None,
     start_page_id: int = 0,
     end_page_id: int | None = None,
+    limit: int | None = None,
+    return_layout_pdf: bool = False,
+    return_span_pdf: bool = False,
 ) -> None:
     api_url = api_url or None
     server_url = server_url or None
     if backend.endswith("http-client") and not server_url:
         raise ValueError(f"backend={backend} requires server_url")
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be a positive integer or None")
 
     input_files = collect_input_files(input_path)
+    if limit is not None:
+        total = len(input_files)
+        input_files = input_files[:limit]
+        if not input_files:
+            raise ValueError(f"limit={limit} leaves no files to process (had {total})")
+        if len(input_files) < total:
+            print(f"limit={limit}: processing {len(input_files)} of {total} file(s) (sorted by name)")
     output_path = Path(output_dir).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -120,6 +137,8 @@ async def run_demo(
         server_url=server_url,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
+        return_layout_pdf=return_layout_pdf,
+        return_span_pdf=return_span_pdf,
     )
     upload_assets = [
         _api_client.UploadAsset(path=file_path, upload_name=file_path.name)
@@ -225,6 +244,13 @@ def main() -> None:
     # Zero-based page range. Set end_page_id to None to parse to the last page.
     start_page_id = 0
     end_page_id = None
+    # 目录输入时最多处理前 N 个文件（按文件名排序后截取）；单文件或 None 表示不限制。
+    # limit: int | None = None
+    limit = 6
+
+    # 需要 mineru-api 生成并打包 *_layout.pdf / *_span.pdf 时改为 True（默认 False，省时间与体积）。
+    return_layout_pdf = False
+    return_span_pdf = False
 
     # 若要从远端拉模型而非使用本地 models-dir，请在运行前 export MINERU_MODEL_SOURCE=huggingface
     # 或 modelscope，并注释掉上面的 setdefault("local", ...)。
@@ -242,6 +268,9 @@ def main() -> None:
             server_url=server_url,
             start_page_id=start_page_id,
             end_page_id=end_page_id,
+            limit=limit,
+            return_layout_pdf=return_layout_pdf,
+            return_span_pdf=return_span_pdf,
         )
     )
 
