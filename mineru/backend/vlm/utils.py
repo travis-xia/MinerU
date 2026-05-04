@@ -92,6 +92,34 @@ def set_default_gpu_memory_utilization() -> float:
     return default_gpu_memory_utilization
 
 
+def resolve_gpu_memory_utilization_value() -> float:
+    """
+    vLLM `gpu_memory_utilization` when not set via explicit kwargs / CLI.
+
+    Set `MINERU_VLLM_GPU_MEMORY_UTILIZATION` (e.g. 0.7) to override the heuristic
+    from `set_default_gpu_memory_utilization()`. Invalid or out-of-range values
+    fall back to that default.
+    """
+    raw = os.getenv("MINERU_VLLM_GPU_MEMORY_UTILIZATION")
+    if raw is None or str(raw).strip() == "":
+        return set_default_gpu_memory_utilization()
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MINERU_VLLM_GPU_MEMORY_UTILIZATION=%r; using automatic default",
+            raw,
+        )
+        return set_default_gpu_memory_utilization()
+    if not (0.0 < value <= 1.0):
+        logger.warning(
+            "MINERU_VLLM_GPU_MEMORY_UTILIZATION must be in (0, 1], got %s; using automatic default",
+            value,
+        )
+        return set_default_gpu_memory_utilization()
+    return value
+
+
 def set_default_batch_size() -> int:
     try:
         device = get_device()

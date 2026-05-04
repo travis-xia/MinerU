@@ -284,6 +284,8 @@ def main() -> None:
     os.environ.setdefault("MINERU_API_MAX_CONCURRENT_REQUESTS", "4")
     # hybrid / VLM / pipeline 每批处理的最大页数（get_processing_window_size）；不覆盖 shell 里已 export 的值。
     os.environ.setdefault("MINERU_PROCESSING_WINDOW_SIZE", "80")
+    # vLLM 引擎 gpu_memory_utilization（0~1）；仅在未通过 mineru-api 额外参数显式传入时生效。
+    os.environ.setdefault("MINERU_VLLM_GPU_MEMORY_UTILIZATION", "0.7")
     # 指定设备用环境变量 MINERU_DEVICE_MODE（如 cuda）；与 json 里的 device-mode 无关，需要时可取消注释：
     # os.environ.setdefault("MINERU_DEVICE_MODE", "cuda")
 

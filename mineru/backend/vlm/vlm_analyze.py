@@ -12,8 +12,8 @@ import pypdfium2 as pdfium
 from loguru import logger
 from tqdm import tqdm
 
-from .utils import enable_custom_logits_processors, set_default_gpu_memory_utilization, set_default_batch_size, \
-    set_lmdeploy_backend, mod_kwargs_by_device_type
+from .utils import enable_custom_logits_processors, set_default_batch_size, \
+    set_lmdeploy_backend, mod_kwargs_by_device_type, resolve_gpu_memory_utilization_value
 from .model_output_to_middle_json import (
     append_page_blocks_to_middle_json,
     finalize_middle_json,
@@ -132,7 +132,7 @@ class ModelSingleton:
                                         f"Failed to parse compilation_config as JSON: {kwargs['compilation_config']}")
                                     del kwargs["compilation_config"]
                         if "gpu_memory_utilization" not in kwargs:
-                            kwargs["gpu_memory_utilization"] = set_default_gpu_memory_utilization()
+                            kwargs["gpu_memory_utilization"] = resolve_gpu_memory_utilization_value()
                         if "model" not in kwargs:
                             kwargs["model"] = model_path
                         if enable_custom_logits_processors() and ("logits_processors" not in kwargs):
@@ -164,7 +164,7 @@ class ModelSingleton:
                                         f"Failed to parse compilation_config: {kwargs['compilation_config']}, error: {e}")
                                     del kwargs["compilation_config"]
                         if "gpu_memory_utilization" not in kwargs:
-                            kwargs["gpu_memory_utilization"] = set_default_gpu_memory_utilization()
+                            kwargs["gpu_memory_utilization"] = resolve_gpu_memory_utilization_value()
                         if "model" not in kwargs:
                             kwargs["model"] = model_path
                         if enable_custom_logits_processors() and ("logits_processors" not in kwargs):
