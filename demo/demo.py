@@ -197,30 +197,29 @@ async def run_demo(
 
 def main() -> None:
     demo_dir = Path(__file__).resolve().parent
+    repo_root = demo_dir.parent
 
-    # Input can be a single supported file or a directory containing supported files.
-    input_path = demo_dir / "pdfs"
-    # Parsed outputs will be extracted into this directory.
-    output_dir = demo_dir / "api_output"
-    # Set this to an existing MinerU FastAPI base URL, for example:
-    # "http://127.0.0.1:8000"
-    # Leave it as None to start a temporary local mineru-api automatically.
+    # 本地 models-dir 依赖环境变量 MINERU_MODEL_SOURCE=local；mineru.json 里的 "model-source" 不会被读取。
+    # setdefault 不覆盖已在 shell 中 export 的值。
+    os.environ.setdefault("MINERU_MODEL_SOURCE", "local")
+    # 指定设备用环境变量 MINERU_DEVICE_MODE（如 cuda）；与 json 里的 device-mode 无关，需要时可取消注释：
+    # os.environ.setdefault("MINERU_DEVICE_MODE", "cuda")
+
+    # 等价命令行（在仓库根目录执行时路径一致）:
+    #   mineru -p test_pdfs/test_pdfs/ -o ./output_test_pipeline --lang japan -b pipeline
+    # ~/mineru.json 的 models-dir 仅在 MINERU_MODEL_SOURCE=local 时作为模型根目录。
+    input_path = repo_root / "test_pdfs" / "test_pdfs"
+    output_dir = repo_root / "output_test_pipeline"
+
+    # 若已手动启动 mineru-api，可设为 "http://127.0.0.1:8000"；None 则自动起临时本地服务。
     api_url = None
 
-    # Available examples:
-    # "hybrid-auto-engine"   -> local hybrid parsing, recommended default
-    # "pipeline"             -> more general OCR/text pipeline
-    # "vlm-auto-engine"      -> local VLM parsing
-    # "vlm-http-client"      -> remote OpenAI-compatible VLM server
-    # "hybrid-http-client"   -> remote OpenAI-compatible hybrid server
-    backend = "hybrid-auto-engine"
-    # Available options:
-    # "auto" -> let MinerU choose between text extraction and OCR
-    # "txt"  -> force text extraction
-    # "ocr"  -> force OCR
+    # "hybrid-auto-engine" | "pipeline" | "vlm-auto-engine" | "*-http-client" 等
+    backend = "pipeline"
+    # "auto" | "txt" | "ocr"
     parse_method = "auto"
-    # OCR language hint. This is mainly used by pipeline and hybrid backends.
-    language = "ch"
+    # 与 CLI --lang 一致；pipeline / hybrid 的 OCR 语言提示
+    language = "japan"
     # Enable formula parsing in the output.
     formula_enable = True
     # Enable table parsing in the output.
@@ -232,8 +231,8 @@ def main() -> None:
     start_page_id = 0
     end_page_id = None
 
-    """如果您由于网络问题无法下载模型，可以设置环境变量MINERU_MODEL_SOURCE为modelscope使用免代理仓库下载模型"""
-    # os.environ['MINERU_MODEL_SOURCE'] = "modelscope"
+    # 若要从远端拉模型而非使用本地 models-dir，请在运行前 export MINERU_MODEL_SOURCE=huggingface
+    # 或 modelscope，并注释掉上面的 setdefault("local", ...)。
 
     asyncio.run(
         run_demo(
