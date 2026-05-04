@@ -196,20 +196,15 @@ async def run_demo(
 
 
 def main() -> None:
-    demo_dir = Path(__file__).resolve().parent
-    repo_root = demo_dir.parent
-
     # 本地 models-dir 依赖环境变量 MINERU_MODEL_SOURCE=local；mineru.json 里的 "model-source" 不会被读取。
     # setdefault 不覆盖已在 shell 中 export 的值。
     os.environ.setdefault("MINERU_MODEL_SOURCE", "local")
     # 指定设备用环境变量 MINERU_DEVICE_MODE（如 cuda）；与 json 里的 device-mode 无关，需要时可取消注释：
     # os.environ.setdefault("MINERU_DEVICE_MODE", "cuda")
 
-    # 等价命令行（在仓库根目录执行时路径一致）:
-    #   mineru -p test_pdfs/test_pdfs/ -o ./output_test_pipeline --lang japan -b pipeline
-    # ~/mineru.json 的 models-dir 仅在 MINERU_MODEL_SOURCE=local 时作为模型根目录。
-    input_path = repo_root / "test_pdfs" / "test_pdfs"
-    output_dir = repo_root / "output_test_pipeline"
+    # 使用绝对路径
+    input_path = Path("/root/autodl-tmp/test_pdfs/test_pdfs/")
+    output_dir = Path("/root/autodl-tmp/output_test_pipeline")
 
     # 若已手动启动 mineru-api，可设为 "http://127.0.0.1:8000"；None 则自动起临时本地服务。
     api_url = None
