@@ -232,16 +232,19 @@ async def run_demo(
                     server_health.max_concurrent_requests,
                 )
 
-            # 与 mineru CLI run_orchestrated_cli 一致：拿到 /health 后再 plan（pipeline 依赖 processing_window_size）。
+            # 与 mineru CLI run_orchestrated_cli 一致：拿到 /health 后再 plan（pipeline / hybrid 依赖 processing_window_size）。
             processing_window_size = (
                 server_health.processing_window_size
-                if backend == "pipeline"
+                if backend == "pipeline" or backend.startswith("hybrid-")
                 else DEFAULT_PROCESSING_WINDOW_SIZE
             )
             planned_tasks = plan_tasks(
                 documents=documents,
                 backend=backend,
                 processing_window_size=processing_window_size,
+                parse_method=parse_method,
+                start_page_id=start_page_id,
+                end_page_id=end_page_id,
             )
 
             print(f"Using API: {server_health.base_url}")
@@ -290,8 +293,8 @@ def main() -> None:
     # os.environ.setdefault("MINERU_DEVICE_MODE", "cuda")
 
     # 使用绝对路径
-    input_path = Path("/root/autodl-tmp/test_pdfs/test_pdfs/")
-    output_dir = Path("/root/autodl-tmp/output_test_pipeline")
+    input_path = Path("/inspire/qb-ilm/project/traffic-congestion-management/xiacheng-240108120111/lava/test_pdfs/test_pdfs")
+    output_dir = Path("output/output_test_demo")
 
     # 若已手动启动 mineru-api，可设为 "http://127.0.0.1:8000"；None 则自动起临时本地服务。
     api_url = None

@@ -21,6 +21,7 @@ from mineru.utils.config_reader import (
     get_max_concurrent_requests as read_max_concurrent_requests,
 )
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
+from mineru.utils.pdf_classify import classify as classify_pdf
 from mineru.utils.pdf_page_id import get_end_page_id
 from mineru.utils.pdfium_guard import (
     close_pdfium_document,
@@ -35,6 +36,8 @@ from mineru.cli.common import (
     image_suffixes,
     office_suffixes,
     pdf_suffixes,
+    read_fn,
+    convert_pdf_bytes_to_bytes,
     uniquify_task_stems,
 )
 from mineru.cli import api_client as _api_client
@@ -54,6 +57,7 @@ class InputDocument:
     stem: str
     effective_pages: int
     order: int
+    ocr_classify: bool | None = None
 
 
 @dataclass
@@ -548,6 +552,7 @@ def collect_input_documents(
                 stem=effective_stem,
                 effective_pages=document.effective_pages,
                 order=document.order,
+                ocr_classify=document.ocr_classify,
             )
             for document, effective_stem in zip(collected, normalized_stems)
         ]
@@ -600,13 +605,148 @@ def plan_pipeline_tasks(
     return bins
 
 
+def _resolve_document_ocr_classify(
+    document: InputDocument,
+    parse_method: str,
+    start_page_id: int,
+    end_page_id: int | None,
+) -> bool:
+    if document.ocr_classify is not None:
+        return document.ocr_classify
+    if parse_method == "ocr":
+        return True
+    if parse_method == "txt":
+        return False
+
+    try:
+        pdf_bytes = read_fn(document.path, document.suffix)
+        pdf_bytes = convert_pdf_bytes_to_bytes(
+            pdf_bytes,
+            start_page_id=start_page_id,
+            end_page_id=end_page_id,
+        )
+        return classify_pdf(pdf_bytes) == "ocr"
+    except Exception as exc:
+        logger.warning(
+            f"Failed to classify document {document.path.name} for hybrid task planning: "
+            f"{exc}. Fallback to non-OCR grouping."
+        )
+        return False
+
+
+def _max_task_pages_for_documents(
+    documents: list[InputDocument],
+    processing_window_size: int,
+) -> int:
+    if not documents:
+        return processing_window_size
+
+    has_oversized_document = any(
+        document.effective_pages > processing_window_size for document in documents
+    )
+    task_limit = processing_window_size * 2 if has_oversized_document else processing_window_size
+    return max(task_limit, max(document.effective_pages for document in documents))
+
+
+def plan_hybrid_tasks(
+    documents: list[InputDocument],
+    processing_window_size: int,
+    parse_method: str,
+    start_page_id: int,
+    end_page_id: int | None,
+) -> list[PlannedTask]:
+    grouped_documents: dict[bool, list[InputDocument]] = {
+        False: [],
+        True: [],
+    }
+    for document in documents:
+        grouped_documents[
+            _resolve_document_ocr_classify(
+                document,
+                parse_method=parse_method,
+                start_page_id=start_page_id,
+                end_page_id=end_page_id,
+            )
+        ].append(document)
+
+    bins: list[PlannedTask] = []
+    for ocr_group in (False, True):
+        sorted_docs = sorted(
+            grouped_documents[ocr_group],
+            key=lambda doc: (-doc.effective_pages, doc.order),
+        )
+        for document in sorted_docs:
+            candidates = []
+            for task in bins:
+                if any(
+                    existing.ocr_classify != ocr_group
+                    for existing in task.documents
+                    if existing.ocr_classify is not None
+                ):
+                    continue
+                combined_documents = task.documents + [document]
+                combined_limit = _max_task_pages_for_documents(
+                    combined_documents,
+                    processing_window_size,
+                )
+                if task.total_pages + document.effective_pages <= combined_limit:
+                    candidates.append(task)
+
+            if candidates:
+                selected = min(candidates, key=lambda task: (task.total_pages, task.index))
+                selected.documents.append(
+                    InputDocument(
+                        path=document.path,
+                        suffix=document.suffix,
+                        stem=document.stem,
+                        effective_pages=document.effective_pages,
+                        order=document.order,
+                        ocr_classify=ocr_group,
+                    )
+                )
+                selected.total_pages += document.effective_pages
+                continue
+
+            bins.append(
+                PlannedTask(
+                    index=len(bins) + 1,
+                    documents=[
+                        InputDocument(
+                            path=document.path,
+                            suffix=document.suffix,
+                            stem=document.stem,
+                            effective_pages=document.effective_pages,
+                            order=document.order,
+                            ocr_classify=ocr_group,
+                        )
+                    ],
+                    total_pages=document.effective_pages,
+                )
+            )
+
+    for index, task in enumerate(bins, start=1):
+        task.index = index
+    return bins
+
+
 def plan_tasks(
     documents: list[InputDocument],
     backend: str,
     processing_window_size: int,
+    parse_method: str = "auto",
+    start_page_id: int = 0,
+    end_page_id: int | None = None,
 ) -> list[PlannedTask]:
     if backend == "pipeline":
         return plan_pipeline_tasks(documents, processing_window_size)
+    if backend.startswith("hybrid-"):
+        return plan_hybrid_tasks(
+            documents,
+            processing_window_size,
+            parse_method=parse_method,
+            start_page_id=start_page_id,
+            end_page_id=end_page_id,
+        )
     return [
         PlannedTask(index=index, documents=[document], total_pages=document.effective_pages)
         for index, document in enumerate(documents, start=1)
@@ -895,8 +1035,11 @@ async def run_orchestrated_cli(
                 documents=documents,
                 backend=backend,
                 processing_window_size=server_health.processing_window_size
-                if backend == "pipeline"
+                if backend == "pipeline" or backend.startswith("hybrid-")
                 else DEFAULT_PROCESSING_WINDOW_SIZE,
+                parse_method=method,
+                start_page_id=start_page_id,
+                end_page_id=end_page_id,
             )
             progress = build_task_execution_progress(planned_tasks)
             concurrency = resolve_submit_concurrency(

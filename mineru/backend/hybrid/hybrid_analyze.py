@@ -541,6 +541,470 @@ def _close_images(images_list):
                 pass
 
 
+def _format_doc_slices(batch_slices):
+    return ",".join(
+        f"doc{item['doc_index']}:{item['page_start'] + 1}-{item['page_end'] + 1}"
+        for item in batch_slices
+    )
+
+
+def _finalize_processing_window_context(context, on_doc_ready):
+    if context['closed']:
+        return
+    finalize_middle_json(
+        context['middle_json']['pdf_info'],
+        context['hybrid_pipeline_model'],
+        context['ocr_enable'],
+        context['vlm_ocr_enable'],
+    )
+    logger.debug(
+        f"Hybrid doc ready: doc{context['doc_index']} pages={context['page_count']}"
+    )
+    on_doc_ready(
+        context['doc_index'],
+        context['model_list'],
+        context['middle_json'],
+        context['vlm_ocr_enable'],
+    )
+    close_pdfium_document(context['pdf_doc'])
+    context['closed'] = True
+
+
+def _emit_zero_page_contexts(doc_contexts, on_doc_ready):
+    for context in doc_contexts:
+        if context['page_count'] == 0 and not context['closed']:
+            _finalize_processing_window_context(context, on_doc_ready)
+
+
+def _group_batch_payloads(batch_payloads):
+    grouped_payloads = defaultdict(list)
+    for payload in batch_payloads:
+        context = payload[0]
+        grouped_payloads[
+            (
+                context['vlm_ocr_enable'],
+                context['ocr_enable'],
+                context['lang'],
+            )
+        ].append(payload)
+    return grouped_payloads
+
+
+def doc_analyze_streaming(
+    pdf_bytes_list,
+    image_writer_list,
+    lang_list,
+    on_doc_ready,
+    predictor: MinerUClient | None = None,
+    backend="transformers",
+    parse_method: str = 'auto',
+    inline_formula_enable: bool = True,
+    model_path: str | None = None,
+    server_url: str | None = None,
+    **kwargs,
+):
+    if not (len(pdf_bytes_list) == len(image_writer_list) == len(lang_list)):
+        raise ValueError("pdf_bytes_list, image_writer_list, and lang_list must have the same length")
+
+    if predictor is None:
+        predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
+    predictor = _maybe_enable_serial_execution(predictor, backend)
+
+    device = get_device()
+    doc_contexts = []
+    total_pages = 0
+    for doc_index, (pdf_bytes, image_writer, lang) in enumerate(
+        zip(pdf_bytes_list, image_writer_list, lang_list)
+    ):
+        _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
+        _vlm_ocr_enable = _should_enable_vlm_ocr(_ocr_enable, lang, inline_formula_enable)
+        pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
+        page_count = get_pdfium_document_page_count(pdf_doc)
+        total_pages += page_count
+        doc_contexts.append(
+            {
+                'doc_index': doc_index,
+                'pdf_bytes': pdf_bytes,
+                'pdf_doc': pdf_doc,
+                'page_count': page_count,
+                'next_page_idx': 0,
+                'middle_json': init_middle_json(_ocr_enable, _vlm_ocr_enable),
+                'model_list': [],
+                'image_writer': image_writer,
+                'lang': lang,
+                'ocr_enable': _ocr_enable,
+                'vlm_ocr_enable': _vlm_ocr_enable,
+                'hybrid_pipeline_model': None,
+                'closed': False,
+            }
+        )
+
+    if total_pages == 0:
+        _emit_zero_page_contexts(doc_contexts, on_doc_ready)
+        return
+
+    configured_window_size = get_processing_window_size(default=64)
+    total_batches = (total_pages + configured_window_size - 1) // configured_window_size
+    logger.info(
+        f'Hybrid processing-window multi-file run. doc_count={len(doc_contexts)}, '
+        f'total_pages={total_pages}, window_size={configured_window_size}, '
+        f'total_batches={total_batches}'
+    )
+
+    batch_ratio = get_batch_ratio(device)
+    _emit_zero_page_contexts(doc_contexts, on_doc_ready)
+    processed_pages = 0
+    infer_start = time.time()
+    try:
+        progress_bar = None
+        last_append_end_time = None
+        try:
+            batch_index = 0
+            while processed_pages < total_pages:
+                batch_index += 1
+                batch_capacity = configured_window_size
+                batch_payloads = []
+                batch_slices = []
+                loaded_pages = 0
+
+                for context in doc_contexts:
+                    if batch_capacity == 0:
+                        break
+                    page_start = context['next_page_idx']
+                    if page_start >= context['page_count']:
+                        continue
+                    take_count = min(batch_capacity, context['page_count'] - page_start)
+                    page_end = page_start + take_count - 1
+                    images_list = load_images_from_pdf_doc(
+                        context['pdf_doc'],
+                        start_page_id=page_start,
+                        end_page_id=page_end,
+                        image_type=ImageType.PIL,
+                        pdf_bytes=context['pdf_bytes'],
+                    )
+                    batch_payloads.append((context, images_list, page_start, take_count))
+                    batch_slices.append(
+                        {
+                            'doc_index': context['doc_index'],
+                            'page_start': page_start,
+                            'page_end': page_end,
+                        }
+                    )
+                    context['next_page_idx'] = page_end + 1
+                    batch_capacity -= take_count
+                    loaded_pages += take_count
+
+                logger.info(
+                    f'Hybrid processing window batch {batch_index}/{total_batches}: '
+                    f'{processed_pages + loaded_pages}/{total_pages} pages, '
+                    f'batch_pages={loaded_pages}, doc_slices={_format_doc_slices(batch_slices)}'
+                )
+
+                payload_model_results = {}
+                try:
+                    for (
+                        subgroup_vlm_ocr_enable,
+                        subgroup_ocr_enable,
+                        subgroup_lang,
+                    ), subgroup_payloads in _group_batch_payloads(batch_payloads).items():
+                        subgroup_images = []
+                        for _, images_list, _, _ in subgroup_payloads:
+                            subgroup_images.extend(
+                                image_dict["img_pil"] for image_dict in images_list
+                            )
+
+                        if subgroup_vlm_ocr_enable:
+                            with predictor_execution_guard(predictor):
+                                subgroup_model_list = predictor.batch_two_step_extract(
+                                    images=subgroup_images
+                                )
+                            subgroup_hybrid_pipeline_model = None
+                        else:
+                            with predictor_execution_guard(predictor):
+                                subgroup_model_list = predictor.batch_two_step_extract(
+                                    images=subgroup_images,
+                                    not_extract_list=not_extract_list,
+                                )
+                            subgroup_model_list, subgroup_hybrid_pipeline_model = _process_ocr_and_formulas(
+                                subgroup_images,
+                                subgroup_model_list,
+                                subgroup_lang,
+                                inline_formula_enable,
+                                subgroup_ocr_enable,
+                                batch_ratio=batch_ratio,
+                            )
+
+                        result_offset = 0
+                        for context, _, page_start, take_count in subgroup_payloads:
+                            payload_model_results[(context['doc_index'], page_start)] = (
+                                subgroup_model_list[result_offset: result_offset + take_count],
+                                subgroup_hybrid_pipeline_model,
+                            )
+                            result_offset += take_count
+
+                    if progress_bar is None:
+                        progress_bar = tqdm(total=total_pages, desc="Processing pages")
+                    else:
+                        exclude_progress_bar_idle_time(
+                            progress_bar,
+                            last_append_end_time,
+                            now=time.time(),
+                        )
+
+                    for context, images_list, page_start, take_count in batch_payloads:
+                        payload_key = (context['doc_index'], page_start)
+                        result_slice, subgroup_hybrid_pipeline_model = payload_model_results[payload_key]
+                        context['model_list'].extend(result_slice)
+                        if subgroup_hybrid_pipeline_model is not None:
+                            context['hybrid_pipeline_model'] = subgroup_hybrid_pipeline_model
+                        append_page_model_list_to_middle_json(
+                            context['middle_json'],
+                            result_slice,
+                            images_list,
+                            context['pdf_doc'],
+                            context['image_writer'],
+                            page_start_index=page_start,
+                            _ocr_enable=context['ocr_enable'],
+                            _vlm_ocr_enable=context['vlm_ocr_enable'],
+                            progress_bar=progress_bar,
+                        )
+                        _close_images(images_list)
+                        images_list.clear()
+
+                        if context['next_page_idx'] >= context['page_count'] and not context['closed']:
+                            _finalize_processing_window_context(context, on_doc_ready)
+
+                    last_append_end_time = time.time()
+                    processed_pages += loaded_pages
+                finally:
+                    for _, images_list, _, _ in batch_payloads:
+                        _close_images(images_list)
+                        images_list.clear()
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
+
+        infer_time = round(time.time() - infer_start, 2)
+        if infer_time > 0:
+            logger.debug(
+                f"processing-window multi-file infer finished, cost: {infer_time}, "
+                f"speed: {round(total_pages / infer_time, 3)} page/s"
+            )
+        clean_memory(device)
+    finally:
+        for context in doc_contexts:
+            if not context['closed']:
+                close_pdfium_document(context['pdf_doc'])
+                context['closed'] = True
+
+
+async def aio_doc_analyze_streaming(
+    pdf_bytes_list,
+    image_writer_list,
+    lang_list,
+    on_doc_ready,
+    predictor: MinerUClient | None = None,
+    backend="transformers",
+    parse_method: str = 'auto',
+    inline_formula_enable: bool = True,
+    model_path: str | None = None,
+    server_url: str | None = None,
+    **kwargs,
+):
+    if not (len(pdf_bytes_list) == len(image_writer_list) == len(lang_list)):
+        raise ValueError("pdf_bytes_list, image_writer_list, and lang_list must have the same length")
+
+    if predictor is None:
+        predictor = await _get_model_async(backend, model_path, server_url, **kwargs)
+    predictor = _maybe_enable_serial_execution(predictor, backend)
+
+    device = get_device()
+    doc_contexts = []
+    total_pages = 0
+    for doc_index, (pdf_bytes, image_writer, lang) in enumerate(
+        zip(pdf_bytes_list, image_writer_list, lang_list)
+    ):
+        _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
+        _vlm_ocr_enable = _should_enable_vlm_ocr(_ocr_enable, lang, inline_formula_enable)
+        pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
+        page_count = get_pdfium_document_page_count(pdf_doc)
+        total_pages += page_count
+        doc_contexts.append(
+            {
+                'doc_index': doc_index,
+                'pdf_bytes': pdf_bytes,
+                'pdf_doc': pdf_doc,
+                'page_count': page_count,
+                'next_page_idx': 0,
+                'middle_json': init_middle_json(_ocr_enable, _vlm_ocr_enable),
+                'model_list': [],
+                'image_writer': image_writer,
+                'lang': lang,
+                'ocr_enable': _ocr_enable,
+                'vlm_ocr_enable': _vlm_ocr_enable,
+                'hybrid_pipeline_model': None,
+                'closed': False,
+            }
+        )
+
+    if total_pages == 0:
+        _emit_zero_page_contexts(doc_contexts, on_doc_ready)
+        return
+
+    configured_window_size = get_processing_window_size(default=64)
+    total_batches = (total_pages + configured_window_size - 1) // configured_window_size
+    logger.info(
+        f'Hybrid processing-window multi-file run. doc_count={len(doc_contexts)}, '
+        f'total_pages={total_pages}, window_size={configured_window_size}, '
+        f'total_batches={total_batches}'
+    )
+
+    batch_ratio = get_batch_ratio(device)
+    _emit_zero_page_contexts(doc_contexts, on_doc_ready)
+    processed_pages = 0
+    infer_start = time.time()
+    try:
+        progress_bar = None
+        last_append_end_time = None
+        try:
+            batch_index = 0
+            while processed_pages < total_pages:
+                batch_index += 1
+                batch_capacity = configured_window_size
+                batch_payloads = []
+                batch_slices = []
+                loaded_pages = 0
+
+                for context in doc_contexts:
+                    if batch_capacity == 0:
+                        break
+                    page_start = context['next_page_idx']
+                    if page_start >= context['page_count']:
+                        continue
+                    take_count = min(batch_capacity, context['page_count'] - page_start)
+                    page_end = page_start + take_count - 1
+                    images_list = await aio_load_images_from_pdf_bytes_range(
+                        context['pdf_bytes'],
+                        start_page_id=page_start,
+                        end_page_id=page_end,
+                        image_type=ImageType.PIL,
+                    )
+                    batch_payloads.append((context, images_list, page_start, take_count))
+                    batch_slices.append(
+                        {
+                            'doc_index': context['doc_index'],
+                            'page_start': page_start,
+                            'page_end': page_end,
+                        }
+                    )
+                    context['next_page_idx'] = page_end + 1
+                    batch_capacity -= take_count
+                    loaded_pages += take_count
+
+                logger.info(
+                    f'Hybrid processing window batch {batch_index}/{total_batches}: '
+                    f'{processed_pages + loaded_pages}/{total_pages} pages, '
+                    f'batch_pages={loaded_pages}, doc_slices={_format_doc_slices(batch_slices)}'
+                )
+
+                payload_model_results = {}
+                try:
+                    for (
+                        subgroup_vlm_ocr_enable,
+                        subgroup_ocr_enable,
+                        subgroup_lang,
+                    ), subgroup_payloads in _group_batch_payloads(batch_payloads).items():
+                        subgroup_images = []
+                        for _, images_list, _, _ in subgroup_payloads:
+                            subgroup_images.extend(
+                                image_dict["img_pil"] for image_dict in images_list
+                            )
+
+                        if subgroup_vlm_ocr_enable:
+                            async with aio_predictor_execution_guard(predictor):
+                                subgroup_model_list = await predictor.aio_batch_two_step_extract(
+                                    images=subgroup_images
+                                )
+                            subgroup_hybrid_pipeline_model = None
+                        else:
+                            async with aio_predictor_execution_guard(predictor):
+                                subgroup_model_list = await predictor.aio_batch_two_step_extract(
+                                    images=subgroup_images,
+                                    not_extract_list=not_extract_list,
+                                )
+                            subgroup_model_list, subgroup_hybrid_pipeline_model = _process_ocr_and_formulas(
+                                subgroup_images,
+                                subgroup_model_list,
+                                subgroup_lang,
+                                inline_formula_enable,
+                                subgroup_ocr_enable,
+                                batch_ratio=batch_ratio,
+                            )
+
+                        result_offset = 0
+                        for context, _, page_start, take_count in subgroup_payloads:
+                            payload_model_results[(context['doc_index'], page_start)] = (
+                                subgroup_model_list[result_offset: result_offset + take_count],
+                                subgroup_hybrid_pipeline_model,
+                            )
+                            result_offset += take_count
+
+                    if progress_bar is None:
+                        progress_bar = tqdm(total=total_pages, desc="Processing pages")
+                    else:
+                        exclude_progress_bar_idle_time(
+                            progress_bar,
+                            last_append_end_time,
+                            now=time.time(),
+                        )
+
+                    for context, images_list, page_start, take_count in batch_payloads:
+                        payload_key = (context['doc_index'], page_start)
+                        result_slice, subgroup_hybrid_pipeline_model = payload_model_results[payload_key]
+                        context['model_list'].extend(result_slice)
+                        if subgroup_hybrid_pipeline_model is not None:
+                            context['hybrid_pipeline_model'] = subgroup_hybrid_pipeline_model
+                        append_page_model_list_to_middle_json(
+                            context['middle_json'],
+                            result_slice,
+                            images_list,
+                            context['pdf_doc'],
+                            context['image_writer'],
+                            page_start_index=page_start,
+                            _ocr_enable=context['ocr_enable'],
+                            _vlm_ocr_enable=context['vlm_ocr_enable'],
+                            progress_bar=progress_bar,
+                        )
+                        _close_images(images_list)
+                        images_list.clear()
+
+                        if context['next_page_idx'] >= context['page_count'] and not context['closed']:
+                            _finalize_processing_window_context(context, on_doc_ready)
+
+                    last_append_end_time = time.time()
+                    processed_pages += loaded_pages
+                finally:
+                    for _, images_list, _, _ in batch_payloads:
+                        _close_images(images_list)
+                        images_list.clear()
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
+
+        infer_time = round(time.time() - infer_start, 2)
+        if infer_time > 0:
+            logger.debug(
+                f"processing-window multi-file infer finished, cost: {infer_time}, "
+                f"speed: {round(total_pages / infer_time, 3)} page/s"
+            )
+        clean_memory(device)
+    finally:
+        for context in doc_contexts:
+            if not context['closed']:
+                close_pdfium_document(context['pdf_doc'])
+                context['closed'] = True
+
+
 def doc_analyze(
         pdf_bytes,
         image_writer: DataWriter | None,

@@ -473,41 +473,79 @@ def _process_hybrid(
         server_url=None,
         **kwargs,
 ):
-    hybrid_doc_analyze = _load_hybrid_analyze_entrypoint(
-        "doc_analyze",
+    hybrid_doc_analyze_streaming = _load_hybrid_analyze_entrypoint(
+        "doc_analyze_streaming",
         f"hybrid-{backend}",
     )
     """同步处理hybrid后端逻辑"""
     if not backend.endswith("client"):
         server_url = None
 
-    for idx, (pdf_bytes, lang) in enumerate(zip(pdf_bytes_list, h_lang_list)):
+    image_writer_list = []
+    md_writer_list = []
+    local_output_info = []
+    for idx, _ in enumerate(pdf_bytes_list):
         pdf_file_name = pdf_file_names[idx]
         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, f"hybrid_{parse_method}")
         image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        image_writer_list.append(image_writer)
+        md_writer_list.append(md_writer)
+        local_output_info.append((pdf_file_name, local_image_dir, local_md_dir))
 
-        middle_json, infer_result, _vlm_ocr_enable = hybrid_doc_analyze(
-            pdf_bytes,
-            image_writer=image_writer,
+    output_futures = []
+
+    def run_output_task(doc_index, middle_json, infer_result, _vlm_ocr_enable):
+        pdf_file_name, local_image_dir, local_md_dir = local_output_info[doc_index]
+        md_writer = md_writer_list[doc_index]
+        pdf_bytes = pdf_bytes_list[doc_index]
+        logger.debug(f"Hybrid output start: doc{doc_index}")
+        try:
+            pdf_info = middle_json["pdf_info"]
+
+            del _vlm_ocr_enable
+            # f_draw_span_bbox = not _vlm_ocr_enable
+            effective_draw_span_bbox = False
+
+            _process_output(
+                pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
+                md_writer, f_draw_layout_bbox, effective_draw_span_bbox, f_dump_orig_pdf,
+                f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
+                f_make_md_mode, middle_json, infer_result, process_mode="vlm"
+            )
+            logger.debug(f"Hybrid output complete: doc{doc_index}")
+        except Exception:
+            logger.exception(f"Hybrid output failed: doc{doc_index}")
+            raise
+
+    with ThreadPoolExecutor(max_workers=1) as output_executor:
+        def on_doc_ready(doc_index, infer_result, middle_json, _vlm_ocr_enable):
+            logger.debug(
+                f"Hybrid doc ready: doc{doc_index} pages={len(middle_json['pdf_info'])} output_submitted=1"
+            )
+            future = output_executor.submit(
+                run_output_task,
+                doc_index,
+                middle_json,
+                infer_result,
+                _vlm_ocr_enable,
+            )
+            output_futures.append(future)
+
+        hybrid_doc_analyze_streaming(
+            pdf_bytes_list,
+            image_writer_list,
+            h_lang_list,
+            on_doc_ready,
             backend=backend,
             parse_method=parse_method,
-            language=lang,
             inline_formula_enable=inline_formula_enable,
             server_url=server_url,
             **kwargs,
         )
 
-        pdf_info = middle_json["pdf_info"]
-
-        # f_draw_span_bbox = not _vlm_ocr_enable
-        f_draw_span_bbox = False
-
-        _process_output(
-            pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
-            md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
-            f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, infer_result, process_mode="vlm"
-        )
+        for future in output_futures:
+            future.result()
+    return
 
 
 async def _async_process_hybrid(
@@ -529,41 +567,79 @@ async def _async_process_hybrid(
         server_url=None,
         **kwargs,
 ):
-    aio_hybrid_doc_analyze = _load_hybrid_analyze_entrypoint(
-        "aio_doc_analyze",
+    aio_hybrid_doc_analyze_streaming = _load_hybrid_analyze_entrypoint(
+        "aio_doc_analyze_streaming",
         f"hybrid-{backend}",
     )
     """异步处理hybrid后端逻辑"""
     if not backend.endswith("client"):
         server_url = None
 
-    for idx, (pdf_bytes, lang) in enumerate(zip(pdf_bytes_list, h_lang_list)):
+    image_writer_list = []
+    md_writer_list = []
+    local_output_info = []
+    for idx, _ in enumerate(pdf_bytes_list):
         pdf_file_name = pdf_file_names[idx]
         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, f"hybrid_{parse_method}")
         image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        image_writer_list.append(image_writer)
+        md_writer_list.append(md_writer)
+        local_output_info.append((pdf_file_name, local_image_dir, local_md_dir))
 
-        middle_json, infer_result, _vlm_ocr_enable = await aio_hybrid_doc_analyze(
-            pdf_bytes,
-            image_writer=image_writer,
+    output_futures = []
+
+    def run_output_task(doc_index, middle_json, infer_result, _vlm_ocr_enable):
+        pdf_file_name, local_image_dir, local_md_dir = local_output_info[doc_index]
+        md_writer = md_writer_list[doc_index]
+        pdf_bytes = pdf_bytes_list[doc_index]
+        logger.debug(f"Hybrid output start: doc{doc_index}")
+        try:
+            pdf_info = middle_json["pdf_info"]
+
+            del _vlm_ocr_enable
+            # f_draw_span_bbox = not _vlm_ocr_enable
+            effective_draw_span_bbox = False
+
+            _process_output(
+                pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
+                md_writer, f_draw_layout_bbox, effective_draw_span_bbox, f_dump_orig_pdf,
+                f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
+                f_make_md_mode, middle_json, infer_result, process_mode="vlm"
+            )
+            logger.debug(f"Hybrid output complete: doc{doc_index}")
+        except Exception:
+            logger.exception(f"Hybrid output failed: doc{doc_index}")
+            raise
+
+    with ThreadPoolExecutor(max_workers=1) as output_executor:
+        def on_doc_ready(doc_index, infer_result, middle_json, _vlm_ocr_enable):
+            logger.debug(
+                f"Hybrid doc ready: doc{doc_index} pages={len(middle_json['pdf_info'])} output_submitted=1"
+            )
+            future = output_executor.submit(
+                run_output_task,
+                doc_index,
+                middle_json,
+                infer_result,
+                _vlm_ocr_enable,
+            )
+            output_futures.append(future)
+
+        await aio_hybrid_doc_analyze_streaming(
+            pdf_bytes_list,
+            image_writer_list,
+            h_lang_list,
+            on_doc_ready,
             backend=backend,
             parse_method=parse_method,
-            language=lang,
             inline_formula_enable=inline_formula_enable,
             server_url=server_url,
             **kwargs,
         )
 
-        pdf_info = middle_json["pdf_info"]
-
-        # f_draw_span_bbox = not _vlm_ocr_enable
-        f_draw_span_bbox = False
-
-        _process_output(
-            pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
-            md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
-            f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, infer_result, process_mode="vlm"
-        )
+        for future in output_futures:
+            future.result()
+    return
 
 
 def _process_office_doc(
