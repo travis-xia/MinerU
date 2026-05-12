@@ -2,6 +2,8 @@
 import asyncio
 import os
 import tempfile
+import time
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -284,9 +286,9 @@ def main() -> None:
     # setdefault 不覆盖已在 shell 中 export 的值。
     os.environ.setdefault("MINERU_MODEL_SOURCE", "local")
     # API 客户端并发请求上限（与 mineru.json 无关，需用环境变量）。
-    os.environ.setdefault("MINERU_API_MAX_CONCURRENT_REQUESTS", "4")
+    os.environ.setdefault("MINERU_API_MAX_CONCURRENT_REQUESTS", "3")
     # hybrid / VLM / pipeline 每批处理的最大页数（get_processing_window_size）；不覆盖 shell 里已 export 的值。
-    os.environ.setdefault("MINERU_PROCESSING_WINDOW_SIZE", "80")
+    os.environ.setdefault("MINERU_PROCESSING_WINDOW_SIZE", "64")
     # vLLM 引擎 gpu_memory_utilization（0~1）；仅在未通过 mineru-api 额外参数显式传入时生效。
     os.environ.setdefault("MINERU_VLLM_GPU_MEMORY_UTILIZATION", "0.7")
     # 指定设备用环境变量 MINERU_DEVICE_MODE（如 cuda）；与 json 里的 device-mode 无关，需要时可取消注释：
@@ -306,7 +308,7 @@ def main() -> None:
     # 与 CLI --lang 一致；pipeline / hybrid 的 OCR 语言提示
     language = "japan"
     # Enable formula parsing in the output.
-    formula_enable = True
+    formula_enable = False
     # Enable table parsing in the output.
     table_enable = True
     # Required only for "*-http-client" backends, for example:
@@ -326,24 +328,36 @@ def main() -> None:
     # 若要从远端拉模型而非使用本地 models-dir，请在运行前 export MINERU_MODEL_SOURCE=huggingface
     # 或 modelscope，并注释掉上面的 setdefault("local", ...)。
 
-    asyncio.run(
-        run_demo(
-            input_path=input_path,
-            output_dir=output_dir,
-            api_url=api_url,
-            backend=backend,
-            parse_method=parse_method,
-            language=language,
-            formula_enable=formula_enable,
-            table_enable=table_enable,
-            server_url=server_url,
-            start_page_id=start_page_id,
-            end_page_id=end_page_id,
-            limit=limit,
-            return_layout_pdf=return_layout_pdf,
-            return_span_pdf=return_span_pdf,
+    demo_start_wall = datetime.now()
+    demo_start_mono = time.perf_counter()
+    print(f"demo 开始时间: {demo_start_wall.isoformat(timespec='seconds')}")
+    try:
+        asyncio.run(
+            run_demo(
+                input_path=input_path,
+                output_dir=output_dir,
+                api_url=api_url,
+                backend=backend,
+                parse_method=parse_method,
+                language=language,
+                formula_enable=formula_enable,
+                table_enable=table_enable,
+                server_url=server_url,
+                start_page_id=start_page_id,
+                end_page_id=end_page_id,
+                limit=limit,
+                return_layout_pdf=return_layout_pdf,
+                return_span_pdf=return_span_pdf,
+            )
         )
-    )
+    finally:
+        demo_end_wall = datetime.now()
+        demo_elapsed_s = time.perf_counter() - demo_start_mono
+        print(f"demo 结束时间: {demo_end_wall.isoformat(timespec='seconds')}")
+        print(
+            f"demo 全程耗时: {demo_elapsed_s:.2f} 秒 "
+            f"({demo_elapsed_s / 60.0:.2f} 分钟)"
+        )
 
 
 if __name__ == "__main__":
